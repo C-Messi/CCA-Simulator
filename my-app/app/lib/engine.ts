@@ -170,12 +170,14 @@ export function validateBid(
 
 // 迭代计算清算价格（处理 tick 跨越）
 // 严格对应合约 _iterateOverTicksAndFindClearingPrice 的逻辑
+// 
+// 关键理解：清算价格 = sumDemand / totalSupply（向上取整）
+// tick 链表只用于更新 sumCurrencyDemandAboveClearingQ96，清算价格本身不受 tick 边界约束
 function iterateAndFindClearingPrice(
   state: SimulationState,
   config: AuctionConfig
 ): { clearingPrice: number; clearingPriceQ96: bigint; sumAboveClearing: number; sumAboveClearingQ96: bigint; nextActiveTickPrice: number } {
   const minimumClearingPriceInit = state.clearingPrice || config.floorPrice;
-  const totalSupplyQ96 = toQ96(config.totalSupply);
   
   const remainingMps = MPS_TOTAL - state.cumulativeMps;
   if (remainingMps <= 0) {
@@ -191,37 +193,64 @@ function iterateAndFindClearingPrice(
   let sumCurrencyDemandAboveClearingQ96 = state.sumCurrencyDemandAboveClearingQ96 || toQ96(state.sumCurrencyDemandAboveClearing);
   let nextActiveTickPrice = state.nextActiveTickPrice;
   let minimumClearingPrice = minimumClearingPriceInit;
-  let minimumClearingPriceQ96 = toQ96(minimumClearingPriceInit);
   
-  // divUp: (a + b - 1) / b
-  const divUpQ96 = (a: bigint, b: bigint): bigint => {
+  // 合约中使用的是整数 totalSupply，不是 Q96
+  const totalSupply = BigInt(config.totalSupply);
+  
+  // divUp: (a + b - 1) / b - 对应合约的 divUp
+  const divUp = (a: bigint, b: bigint): bigint => {
     if (b === 0n) return 0n;
     return (a + b - 1n) / b;
   };
   
-  let clearingPriceQ96 = divUpQ96(sumCurrencyDemandAboveClearingQ96, totalSupplyQ96);
+  // 清算价格 = sumDemandQ96 / totalSupply（向上取整）
+  // 注意：结果仍然是 Q96 格式，因为 sumDemandQ96 是 Q96
+  let clearingPriceQ96 = divUp(sumCurrencyDemandAboveClearingQ96, totalSupply);
   let clearingPrice = fromQ96(clearingPriceQ96);
   
-  while (
-    (nextActiveTickPrice !== MAX_TICK_PTR 
-      && sumCurrencyDemandAboveClearingQ96 >= totalSupplyQ96 * toQ96(nextActiveTickPrice) / FixedPoint96.Q96)
-    || Math.abs(clearingPrice - nextActiveTickPrice) < 1e-10
-  ) {
+  // 合约逻辑：
+  // while (
+  //   (nextActiveTickPrice_ != MAX_TICK_PTR && sumCurrencyDemandAboveClearingQ96_ >= TOTAL_SUPPLY * nextActiveTickPrice_)
+  //   || clearingPrice == nextActiveTickPrice_
+  // )
+  // 
+  // 注意：TOTAL_SUPPLY * nextActiveTickPrice_ 是整数乘法
+  // nextActiveTickPrice_ 在合约中是 Q96 格式的价格
+  while (true) {
+    if (nextActiveTickPrice === MAX_TICK_PTR) break;
+    
+    const nextActiveTickPriceQ96 = toQ96(nextActiveTickPrice);
+    // 合约: sumCurrencyDemandAboveClearingQ96_ >= TOTAL_SUPPLY * nextActiveTickPrice_
+    // 这里 nextActiveTickPrice_ 是 Q96 格式
+    const requiredDemandQ96 = totalSupply * nextActiveTickPriceQ96;
+    
+    const demandExceedsRequired = sumCurrencyDemandAboveClearingQ96 >= requiredDemandQ96;
+    const priceEqualsNextTick = Math.abs(clearingPrice - nextActiveTickPrice) < 1e-10;
+    
+    if (!demandExceedsRequired && !priceEqualsNextTick) break;
+    
     const nextActiveTick = state.ticks.get(nextActiveTickPrice);
     if (!nextActiveTick) break;
     
+    // 从总需求中减去当前 tick 的需求
     const tickDemandQ96 = nextActiveTick.currencyDemandQ96 || toQ96(nextActiveTick.currencyDemand);
     sumCurrencyDemandAboveClearingQ96 -= tickDemandQ96;
+    
+    // 更新最小清算价格为当前 tick 价格
     minimumClearingPrice = nextActiveTickPrice;
-    minimumClearingPriceQ96 = toQ96(nextActiveTickPrice);
+    
+    // 移动到下一个 tick
     nextActiveTickPrice = nextActiveTick.next;
-    clearingPriceQ96 = divUpQ96(sumCurrencyDemandAboveClearingQ96, totalSupplyQ96);
+    
+    // 重新计算清算价格
+    clearingPriceQ96 = divUp(sumCurrencyDemandAboveClearingQ96, totalSupply);
     clearingPrice = fromQ96(clearingPriceQ96);
   }
   
-  if (clearingPriceQ96 < minimumClearingPriceQ96) {
-    clearingPriceQ96 = minimumClearingPriceQ96;
+  // 清算价格不能低于最小清算价格（floor price 或最后迭代过的 tick）
+  if (clearingPrice < minimumClearingPrice) {
     clearingPrice = minimumClearingPrice;
+    clearingPriceQ96 = toQ96(minimumClearingPrice);
   }
   
   return { 
@@ -236,6 +265,11 @@ function iterateAndFindClearingPrice(
 
 // 在清算价格处销售代币
 // 严格参考合约 _sellTokensAtClearingPrice 的逻辑
+// 
+// 合约逻辑：
+// 1. 基础情况：所有需求都严格高于清算价格，贡献 = sumAboveQ96 * deltaMps
+// 2. 特殊情况：清算价格恰好在某个有需求的 tick 上（priceQ96 % TICK_SPACING == 0）
+//    此时该 tick 上的竞价者可能被部分成交
 function sellTokensAtClearingPrice(
   state: SimulationState,
   config: AuctionConfig,
@@ -243,46 +277,53 @@ function sellTokensAtClearingPrice(
   clearingPrice: number,
   clearingPriceQ96: bigint
 ): { currencyRaised: number; totalCleared: number; currencyRaisedAtClearingPrice: number; currencyRaisedAtClearingPriceQ96_X7: bigint } {
-  const sumAbove = state.sumCurrencyDemandAboveClearing;
-  const MPS = BigInt(MPS_TOTAL);
+  const sumAboveQ96 = state.sumCurrencyDemandAboveClearingQ96 || toQ96(state.sumCurrencyDemandAboveClearing);
+  const deltaMpsU = BigInt(deltaMps);
   
-  let currencyFromAboveQ96X7 = BigInt(Math.round(sumAbove * deltaMps)) * FixedPoint96.Q96;
+  // 基础情况：需求严格高于清算价格
+  // currencyFromAboveQ96X7 = sumAboveQ96 * deltaMps
+  let currencyFromAboveQ96X7 = sumAboveQ96 * deltaMpsU;
   let currencyAtClearingPriceQ96X7 = 0n;
   
-  // 检查清算价格是否在 tick 边界上（有部分成交的 tick）
-  const tick = state.ticks.get(clearingPrice);
-  if (tick && tick.currencyDemand > 0) {
-    const demandAtPriceQ96 = tick.currencyDemandQ96 || toQ96(tick.currencyDemand);
+  // 特殊情况：检查清算价格是否在 tick 边界上
+  // 合约: if (priceQ96 % TICK_SPACING == 0)
+  // 在我们的实现中，检查是否存在该价格的 tick 且有需求
+  const isOnTickBoundary = clearingPrice % config.tickSpacing === 0;
+  
+  if (isOnTickBoundary) {
+    const tick = state.ticks.get(clearingPrice);
+    const demandAtPriceQ96 = tick?.currencyDemandQ96 || 0n;
     
-    // 严格高于清算价格的需求
-    const demandStrictlyAbove = sumAbove - tick.currencyDemand;
-    const currencyRaisedAboveClearingQ96X7 = BigInt(Math.round(demandStrictlyAbove * deltaMps)) * FixedPoint96.Q96;
-    
-    // (A) 总隐含货币 = TOTAL_SUPPLY * priceQ96 * deltaMps
-    const totalCurrencyForDeltaQ96X7 = BigInt(config.totalSupply) * clearingPriceQ96 * BigInt(deltaMps);
-    
-    // 清算价格处的贡献 = A - 上方贡献
-    const demandAtClearingQ96X7 = totalCurrencyForDeltaQ96X7 - currencyRaisedAboveClearingQ96X7;
-    
-    // (B) 清算价格处 tick 的预期贡献
-    const expectedAtClearingTickQ96X7 = demandAtPriceQ96 * BigInt(deltaMps);
-    
-    // 取较小值（如果价格被向上取整，A 可能超过 B）
-    currencyAtClearingPriceQ96X7 = demandAtClearingQ96X7 < expectedAtClearingTickQ96X7 
-      ? demandAtClearingQ96X7 
-      : expectedAtClearingTickQ96X7;
-    
-    // 实际募集金额 = 上方贡献 + 清算价格处贡献
-    currencyFromAboveQ96X7 = currencyAtClearingPriceQ96X7 + currencyRaisedAboveClearingQ96X7;
+    if (demandAtPriceQ96 > 0n) {
+      // 严格高于清算价格的贡献
+      const currencyRaisedAboveClearingQ96X7 = currencyFromAboveQ96X7;
+      
+      // (A) 总隐含货币 = TOTAL_SUPPLY * priceQ96 * deltaMps
+      const totalCurrencyForDeltaQ96X7 = BigInt(config.totalSupply) * clearingPriceQ96 * deltaMpsU;
+      
+      // 清算价格处的贡献（通过减法得到）= A - 上方贡献
+      const demandAtClearingQ96X7 = totalCurrencyForDeltaQ96X7 - currencyRaisedAboveClearingQ96X7;
+      
+      // (B) 清算价格处 tick 的预期贡献 = tickDemand * deltaMps
+      const expectedAtClearingTickQ96X7 = demandAtPriceQ96 * deltaMpsU;
+      
+      // 取较小值：如果价格被向上取整，(A) 可能超过 (B)
+      currencyAtClearingPriceQ96X7 = demandAtClearingQ96X7 < expectedAtClearingTickQ96X7 
+        ? demandAtClearingQ96X7 
+        : expectedAtClearingTickQ96X7;
+      
+      // 实际募集金额 = 上方贡献 + 清算价格处贡献
+      currencyFromAboveQ96X7 = currencyAtClearingPriceQ96X7 + currencyRaisedAboveClearingQ96X7;
+    }
   }
   
-  // 转换为代币数量（向上取整，确保 totalCleared 不会超过 TOTAL_SUPPLY）
-  // 参考合约: tokensClearedQ96X7 = currencyFromAboveQ96X7.fullMulDivUp(FixedPoint96.Q96, priceQ96)
+  // 转换为代币数量（向上取整）
+  // 合约: tokensClearedQ96X7 = currencyFromAboveQ96X7.fullMulDivUp(FixedPoint96.Q96, priceQ96)
   const tokensClearedQ96X7 = clearingPriceQ96 > 0n 
     ? (currencyFromAboveQ96X7 * FixedPoint96.Q96 + clearingPriceQ96 - 1n) / clearingPriceQ96
     : 0n;
   
-  // 转换回浮点数（除以 Q96 和 MPS）
+  // 转换回浮点数（除以 Q96 和 MPS_TOTAL）
   const currencyFromAbove = Number(currencyFromAboveQ96X7) / Number(FixedPoint96.Q96) / MPS_TOTAL;
   const tokensCleared = Number(tokensClearedQ96X7) / Number(FixedPoint96.Q96) / MPS_TOTAL;
   const currencyAtClearingPrice = Number(currencyAtClearingPriceQ96X7) / Number(FixedPoint96.Q96) / MPS_TOTAL;
