@@ -2,7 +2,7 @@
 
 
 
-根据https://github.com/Uniswap/continuous-clearing-auction搭建的纯前端模拟器，可以通过配置各种参数体验cca功能
+根据https://github.com/Uniswap/continuous-clearing-auction 搭建的纯前端模拟器，可以通过配置各种参数体验cca功能
 
 
 
